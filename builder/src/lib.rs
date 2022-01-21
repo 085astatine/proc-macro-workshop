@@ -83,9 +83,11 @@ fn impl_builder(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
     let builder_name = builder_name(input);
     let struct_fields = struct_fields(&input.data);
     let setters = struct_fields.iter().map(|field| impl_builder_setter(field));
+    let build = impl_builder_build(input);
     quote::quote! {
         impl #builder_name {
             #(#setters)*
+            #build
         }
     }
 }
@@ -97,6 +99,24 @@ fn impl_builder_setter(field: &syn::Field) -> proc_macro2::TokenStream {
         pub fn #name(&mut self, #name: #ty) -> &mut Self {
             self.#name = Some(#name);
             self
+        }
+    }
+}
+
+fn impl_builder_build(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
+    let return_type = &input.ident;
+    let struct_fields = struct_fields(&input.data);
+    let args = struct_fields.iter().map(|field| {
+        let name = &field.ident;
+        quote::quote! {
+            #name: self.#name.clone().unwrap()
+        }
+    });
+    quote::quote! {
+        pub fn build(&mut self) -> Result<#return_type, Box<dyn std::error::Error>> {
+            Ok(#return_type {
+                #(#args),*
+            })
         }
     }
 }
