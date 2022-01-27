@@ -32,6 +32,37 @@ fn struct_fields(data: &syn::Data) -> Vec<&syn::Field> {
     }
 }
 
+fn last_path_segment(ty: &syn::Type) -> Option<&syn::PathSegment> {
+    if let syn::Type::Path(ref ty) = ty {
+        ty.path.segments.last()
+    } else {
+        None
+    }
+}
+
+fn is_option_type(ty: &syn::Type) -> bool {
+    if let Some(last_segment) = last_path_segment(ty) {
+        last_segment.ident == "Option"
+    } else {
+        false
+    }
+}
+
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let Some(last_segment) = last_path_segment(ty) {
+        if last_segment.ident == "Option" {
+            if let syn::PathArguments::AngleBracketed(arguments) = &last_segment.arguments {
+                for arg in &arguments.args {
+                    if let syn::GenericArgument::Type(generic_type) = arg {
+                        return Some(&generic_type);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn struct_builder(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
     let struct_name = builder_name(input);
     let visibility = &input.vis;
@@ -49,8 +80,14 @@ fn struct_builder(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
 fn struct_builder_field(field: &syn::Field) -> proc_macro2::TokenStream {
     let name = &field.ident;
     let ty = &field.ty;
-    quote::quote! {
-        #name: Option<#ty>
+    if is_option_type(ty) {
+        quote::quote! {
+            #name: #ty
+        }
+    } else {
+        quote::quote! {
+            #name: Option<#ty>
+        }
     }
 }
 
@@ -94,7 +131,11 @@ fn impl_builder(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
 
 fn impl_builder_setter(field: &syn::Field) -> proc_macro2::TokenStream {
     let name = &field.ident;
-    let ty = &field.ty;
+    let ty = if is_option_type(&field.ty) {
+        option_inner_type(&field.ty).unwrap()
+    } else {
+        &field.ty
+    };
     quote::quote! {
         pub fn #name(&mut self, #name: #ty) -> &mut Self {
             self.#name = Some(#name);
@@ -108,8 +149,14 @@ fn impl_builder_build(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
     let struct_fields = struct_fields(&input.data);
     let args = struct_fields.iter().map(|field| {
         let name = &field.ident;
-        quote::quote! {
-            #name: self.#name.clone().unwrap()
+        if is_option_type(&field.ty) {
+            quote::quote! {
+                #name: self.#name.clone()
+            }
+        } else {
+            quote::quote! {
+                #name: self.#name.clone().unwrap()
+            }
         }
     });
     quote::quote! {
