@@ -73,21 +73,21 @@ impl<'a> BuilderField<'a> {
                 let name = &value.field.ident;
                 let ty = &value.field.ty;
                 quote::quote! {
-                    #name: Option<#ty>
+                    #name: ::std::option::Option<#ty>
                 }
             }
             Self::Opt(opt) => {
                 let name = &opt.field.ident;
                 let ty = &opt.inner_type;
                 quote::quote! {
-                    #name: Option<#ty>
+                    #name: ::std::option::Option<#ty>
                 }
             }
             Self::Repeated(repeated) => {
                 let name = &repeated.field.ident;
                 let ty = &repeated.inner_type;
                 quote::quote! {
-                    #name: Vec<#ty>
+                    #name: ::std::vec::Vec<#ty>
                 }
             }
         }
@@ -98,19 +98,19 @@ impl<'a> BuilderField<'a> {
             Self::Value(value) => {
                 let name = &value.field.ident;
                 quote::quote! {
-                    #name: None
+                    #name: ::std::option::Option::None
                 }
             }
             Self::Opt(opt) => {
                 let name = &opt.field.ident;
                 quote::quote! {
-                    #name: None
+                    #name: ::std::option::Option::None
                 }
             }
             Self::Repeated(repeated) => {
                 let name = &repeated.field.ident;
                 quote::quote! {
-                    #name: Vec::new()
+                    #name: ::std::vec::Vec::new()
                 }
             }
         }
@@ -123,7 +123,7 @@ impl<'a> BuilderField<'a> {
                 let ty = &value.field.ty;
                 quote::quote! {
                     pub fn #name(&mut self, #name: #ty) -> &mut Self {
-                        self.#name = Some(#name);
+                        self.#name = ::std::option::Option::Some(#name);
                         self
                     }
                 }
@@ -133,7 +133,7 @@ impl<'a> BuilderField<'a> {
                 let ty = &opt.inner_type;
                 quote::quote! {
                     pub fn #name(&mut self, #name: #ty) -> &mut Self {
-                        self.#name = Some(#name);
+                        self.#name = ::std::option::Option::Some(#name);
                         self
                     }
                 }
@@ -212,8 +212,8 @@ fn generate_impl_builder<'a>(
     let build = {
         let args = fields.iter().map(|field| field.generate_build_arg());
         quote::quote! {
-            pub fn build(&mut self) -> Result<#name, Box<dyn std::error::Error>> {
-                Ok(#name {
+            pub fn build(&mut self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
+                ::std::result::Result::Ok(#name {
                     #(#args),*
                 })
             }
