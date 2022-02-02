@@ -13,9 +13,12 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 }
 
 fn derive_impl(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let struct_builder = struct_builder(&input);
-    let impl_struct = impl_struct(&input);
-    let impl_builder = impl_builder(&input)?;
+    let builder = quote::format_ident!("{}Builder", input.ident);
+    let fields = builder_fields(&input.data)?;
+
+    let struct_builder = generate_struct_builder(&builder, &fields, &input.vis);
+    let impl_struct = generate_builder(&input.ident, &builder, &fields);
+    let impl_builder = generate_impl_builder(&input.ident, &builder, &fields);
 
     Ok(quote::quote! {
         #struct_builder
@@ -24,18 +27,276 @@ fn derive_impl(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStream, syn
     })
 }
 
-fn builder_name(data: &syn::DeriveInput) -> syn::Ident {
-    quote::format_ident!("{}Builder", data.ident)
+struct ValueField<'a> {
+    field: &'a syn::Field,
 }
 
-fn struct_fields(data: &syn::Data) -> Vec<&syn::Field> {
+struct OptionField<'a> {
+    field: &'a syn::Field,
+    inner_type: &'a syn::Type,
+}
+
+struct RepeatedField<'a> {
+    field: &'a syn::Field,
+    setter: syn::Ident,
+    inner_type: &'a syn::Type,
+}
+
+enum BuilderField<'a> {
+    Value(ValueField<'a>),
+    Opt(OptionField<'a>),
+    Repeated(RepeatedField<'a>),
+}
+
+impl<'a> BuilderField<'a> {
+    fn new(field: &syn::Field) -> Result<BuilderField, syn::Error> {
+        if let Some(setter) = repeated_field_setter(field)? {
+            if let Some(inner_type) = vector_inner_type(&field.ty) {
+                return Ok(BuilderField::Repeated(RepeatedField {
+                    field,
+                    setter,
+                    inner_type,
+                }));
+            }
+        }
+        if is_option_type(&field.ty) {
+            if let Some(inner_type) = option_inner_type(&field.ty) {
+                return Ok(BuilderField::Opt(OptionField { field, inner_type }));
+            }
+        }
+        Ok(BuilderField::Value(ValueField { field }))
+    }
+
+    fn generate_struct_field(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Value(value) => {
+                let name = &value.field.ident;
+                let ty = &value.field.ty;
+                quote::quote! {
+                    #name: Option<#ty>
+                }
+            }
+            Self::Opt(opt) => {
+                let name = &opt.field.ident;
+                let ty = &opt.inner_type;
+                quote::quote! {
+                    #name: Option<#ty>
+                }
+            }
+            Self::Repeated(repeated) => {
+                let name = &repeated.field.ident;
+                let ty = &repeated.inner_type;
+                quote::quote! {
+                    #name: Vec<#ty>
+                }
+            }
+        }
+    }
+
+    fn generate_initialize_field(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Value(value) => {
+                let name = &value.field.ident;
+                quote::quote! {
+                    #name: None
+                }
+            }
+            Self::Opt(opt) => {
+                let name = &opt.field.ident;
+                quote::quote! {
+                    #name: None
+                }
+            }
+            Self::Repeated(repeated) => {
+                let name = &repeated.field.ident;
+                quote::quote! {
+                    #name: Vec::new()
+                }
+            }
+        }
+    }
+
+    fn generate_setter(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Value(value) => {
+                let name = &value.field.ident;
+                let ty = &value.field.ty;
+                quote::quote! {
+                    pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                        self.#name = Some(#name);
+                        self
+                    }
+                }
+            }
+            Self::Opt(opt) => {
+                let name = &opt.field.ident;
+                let ty = &opt.inner_type;
+                quote::quote! {
+                    pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                        self.#name = Some(#name);
+                        self
+                    }
+                }
+            }
+            Self::Repeated(repeated) => {
+                let name = &repeated.field.ident;
+                let setter = &repeated.setter;
+                let ty = &repeated.inner_type;
+                quote::quote! {
+                    pub fn #setter(&mut self, #setter: #ty) -> &mut Self {
+                        self.#name.push(#setter);
+                        self
+                    }
+                }
+            }
+        }
+    }
+
+    fn generate_build_arg(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Value(value) => {
+                let name = &value.field.ident;
+                quote::quote! {
+                    #name: self.#name.clone().unwrap()
+                }
+            }
+            Self::Opt(opt) => {
+                let name = &opt.field.ident;
+                quote::quote! {
+                    #name: self.#name.clone()
+                }
+            }
+            Self::Repeated(repeated) => {
+                let name = &repeated.field.ident;
+                quote::quote! {
+                    #name: self.#name.clone()
+                }
+            }
+        }
+    }
+}
+
+fn builder_fields<'a>(data: &'a syn::Data) -> Result<Vec<BuilderField<'a>>, syn::Error> {
     match data {
         syn::Data::Struct(ref data) => match data.fields {
-            syn::Fields::Named(ref fields) => fields.named.iter().collect(),
+            syn::Fields::Named(ref fields) => fields
+                .named
+                .iter()
+                .map(|field| BuilderField::new(field))
+                .collect(),
             syn::Fields::Unnamed(_) | syn::Fields::Unit => unimplemented!(),
         },
         syn::Data::Enum(_) | syn::Data::Union(_) => unimplemented!(),
     }
+}
+
+fn generate_struct_builder<'a>(
+    builder: &'a syn::Ident,
+    fields: &'a Vec<BuilderField<'a>>,
+    visibility: &'a syn::Visibility,
+) -> proc_macro2::TokenStream {
+    let fields = fields.iter().map(|field| field.generate_struct_field());
+    quote::quote! {
+        #visibility struct #builder{
+            #(#fields),*
+        }
+    }
+}
+
+fn generate_impl_builder<'a>(
+    name: &'a syn::Ident,
+    builder: &'a syn::Ident,
+    fields: &'a Vec<BuilderField<'a>>,
+) -> proc_macro2::TokenStream {
+    let setters = fields.iter().map(|field| field.generate_setter());
+    let build = {
+        let args = fields.iter().map(|field| field.generate_build_arg());
+        quote::quote! {
+            pub fn build(&mut self) -> Result<#name, Box<dyn std::error::Error>> {
+                Ok(#name {
+                    #(#args),*
+                })
+            }
+        }
+    };
+    quote::quote! {
+        impl #builder {
+            #(#setters)*
+            #build
+        }
+    }
+}
+
+fn generate_builder<'a>(
+    name: &'a syn::Ident,
+    builder: &'a syn::Ident,
+    fields: &'a Vec<BuilderField<'a>>,
+) -> proc_macro2::TokenStream {
+    let args = fields.iter().map(|field| field.generate_initialize_field());
+    quote::quote! {
+        impl #name {
+            pub fn builder() -> #builder {
+                #builder {
+                    #(#args),*
+                }
+            }
+        }
+    }
+}
+
+fn builder_attribute(field: &syn::Field) -> Result<Option<syn::MetaList>, syn::Error> {
+    let mut value = None;
+    for attr in &field.attrs {
+        if let Ok(meta) = attr.parse_meta() {
+            if let Some(ident) = meta.path().get_ident() {
+                if ident == "builder" {
+                    if value.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            "duplicated attribute \"builder\"",
+                        ));
+                    }
+                    if let syn::Meta::List(meta_list) = meta {
+                        value = Some(meta_list);
+                    }
+                }
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn repeated_field_setter(field: &syn::Field) -> Result<Option<syn::Ident>, syn::Error> {
+    use syn::spanned::Spanned;
+
+    let error_message = "expected `builder(each = \"...\")`";
+    if let Some(meta) = builder_attribute(field)? {
+        let meta_span = meta.span();
+        let mut value = None;
+        for nestead in &meta.nested {
+            if let syn::NestedMeta::Meta(nestead_meta) = nestead {
+                if let syn::Meta::NameValue(name_value) = nestead_meta {
+                    if let Some(ident) = name_value.path.get_ident() {
+                        if ident == "each" {
+                            if let syn::Lit::Str(name) = &name_value.lit {
+                                if value.is_some() {
+                                    return Err(syn::Error::new(meta_span, error_message));
+                                }
+                                value = Some(syn::Ident::new(&name.value(), name.span()));
+                            }
+                        } else {
+                            return Err(syn::Error::new(meta_span, error_message));
+                        }
+                    }
+                }
+            }
+        }
+        if value.is_none() {
+            return Err(syn::Error::new(meta_span, error_message));
+        }
+        return Ok(value);
+    }
+    Ok(None)
 }
 
 fn last_path_segment(ty: &syn::Type) -> Option<&syn::PathSegment> {
@@ -82,198 +343,4 @@ fn vector_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
         }
     }
     None
-}
-
-fn struct_builder(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
-    let struct_name = builder_name(input);
-    let visibility = &input.vis;
-    let struct_fields = struct_fields(&input.data);
-    let fields = struct_fields
-        .iter()
-        .map(|field| struct_builder_field(field));
-    quote::quote! {
-        #visibility struct #struct_name {
-            #(#fields),*
-        }
-    }
-}
-
-fn struct_builder_field(field: &syn::Field) -> proc_macro2::TokenStream {
-    let name = &field.ident;
-    let ty = &field.ty;
-    if is_option_type(ty) || is_repeated_field(field) {
-        quote::quote! {
-            #name: #ty
-        }
-    } else {
-        quote::quote! {
-            #name: Option<#ty>
-        }
-    }
-}
-
-fn impl_struct(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
-    let name = &input.ident;
-    let builder_name = builder_name(input);
-    let struct_fields = struct_fields(&input.data);
-    let builder_initialize_fields = struct_fields
-        .iter()
-        .map(|field| impl_struct_initialize_builder_field(field));
-    quote::quote! {
-        impl #name {
-            pub fn builder() -> #builder_name {
-                #builder_name {
-                    #(#builder_initialize_fields),*
-                }
-            }
-        }
-    }
-}
-
-fn impl_struct_initialize_builder_field(field: &syn::Field) -> proc_macro2::TokenStream {
-    let name = &field.ident;
-    if is_repeated_field(field) {
-        quote::quote! {
-            #name: Vec::new()
-        }
-    } else {
-        quote::quote! {
-            #name: None
-        }
-    }
-}
-
-fn impl_builder(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let builder_name = builder_name(input);
-    let struct_fields = struct_fields(&input.data);
-    let mut setters = Vec::new();
-    for field in &struct_fields {
-        setters.push(impl_builder_setter(field)?);
-    }
-    let build = impl_builder_build(input);
-    Ok(quote::quote! {
-        impl #builder_name {
-            #(#setters)*
-            #build
-        }
-    })
-}
-
-fn impl_builder_setter(field: &syn::Field) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let name = field.ident.as_ref().unwrap();
-    match repeat_setter_name(field)? {
-        Some(ref setter_name) => builder_repeat_setter(&name, setter_name, &field.ty),
-        None => Ok(builder_simple_setter(&name, &field.ty)),
-    }
-}
-
-fn builder_simple_setter(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
-    let arg_ty = if is_option_type(ty) {
-        option_inner_type(&ty).unwrap()
-    } else {
-        ty
-    };
-    quote::quote! {
-        pub fn #name(&mut self, #name: #arg_ty) -> &mut Self {
-            self.#name = Some(#name);
-            self
-        }
-    }
-}
-
-fn builder_attribute(field: &syn::Field) -> Result<Option<syn::MetaList>, syn::Error> {
-    let mut value = None;
-    for attr in &field.attrs {
-        if let Ok(meta) = attr.parse_meta() {
-            if let Some(ident) = meta.path().get_ident() {
-                if ident == "builder" {
-                    if value.is_some() {
-                        return Err(syn::Error::new_spanned(
-                            attr,
-                            "duplicated attribute \"builder\"",
-                        ));
-                    }
-                    if let syn::Meta::List(meta_list) = meta {
-                        value = Some(meta_list);
-                    }
-                }
-            }
-        }
-    }
-    Ok(value)
-}
-
-fn is_repeated_field(field: &syn::Field) -> bool {
-    builder_attribute(field).ok().unwrap().is_some()
-}
-
-fn repeat_setter_name(field: &syn::Field) -> Result<Option<syn::Ident>, syn::Error> {
-    use syn::spanned::Spanned;
-
-    let error_message = "expected `builder(each = \"...\")`";
-    if let Some(meta) = builder_attribute(field)? {
-        let meta_span = meta.span();
-        let mut value = None;
-        for nestead in &meta.nested {
-            if let syn::NestedMeta::Meta(nestead_meta) = nestead {
-                if let syn::Meta::NameValue(name_value) = nestead_meta {
-                    if let Some(ident) = name_value.path.get_ident() {
-                        if ident == "each" {
-                            if let syn::Lit::Str(name) = &name_value.lit {
-                                if value.is_some() {
-                                    return Err(syn::Error::new(meta_span, error_message));
-                                }
-                                value = Some(syn::Ident::new(&name.value(), name.span()));
-                            }
-                        } else {
-                            return Err(syn::Error::new(meta_span, error_message));
-                        }
-                    }
-                }
-            }
-        }
-        if value.is_none() {
-            return Err(syn::Error::new(meta_span, error_message));
-        }
-        return Ok(value);
-    }
-    Ok(None)
-}
-
-fn builder_repeat_setter(
-    name: &syn::Ident,
-    setter: &syn::Ident,
-    ty: &syn::Type,
-) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let inner_type = vector_inner_type(ty).unwrap();
-    Ok(quote::quote! {
-        pub fn #setter(& mut self, #setter: #inner_type) -> &mut Self {
-            self.#name.push(#setter);
-            self
-        }
-    })
-}
-
-fn impl_builder_build(input: &syn::DeriveInput) -> proc_macro2::TokenStream {
-    let return_type = &input.ident;
-    let struct_fields = struct_fields(&input.data);
-    let args = struct_fields.iter().map(|field| {
-        let name = &field.ident;
-        if is_option_type(&field.ty) || is_repeated_field(field) {
-            quote::quote! {
-                #name: self.#name.clone()
-            }
-        } else {
-            quote::quote! {
-                #name: self.#name.clone().unwrap()
-            }
-        }
-    });
-    quote::quote! {
-        pub fn build(&mut self) -> Result<#return_type, Box<dyn std::error::Error>> {
-            Ok(#return_type {
-                #(#args),*
-            })
-        }
-    }
 }
