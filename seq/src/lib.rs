@@ -69,19 +69,19 @@ impl syn::parse::Parse for Seq {
     }
 }
 
-fn expand_token_tree<T: ToLiteral>(
+fn expand_token_tree<T: ToLiteral + std::fmt::Display>(
     tree: &proc_macro2::TokenTree,
     target: &syn::Ident,
-    value: &T,
+    index: &T,
 ) -> proc_macro2::TokenTree {
     match tree {
         proc_macro2::TokenTree::Ident(ref ident) if ident == target => {
-            proc_macro2::TokenTree::Literal(value.to_literal(ident))
+            proc_macro2::TokenTree::Literal(index.to_literal(ident))
         }
         proc_macro2::TokenTree::Group(ref group) => {
             let mut expanded = proc_macro2::Group::new(
                 group.delimiter(),
-                expand_token_stream(&group.stream(), target, value),
+                expand_token_stream(&group.stream(), target, index),
             );
             expanded.set_span(group.span());
             proc_macro2::TokenTree::Group(expanded)
@@ -90,15 +90,38 @@ fn expand_token_tree<T: ToLiteral>(
     }
 }
 
-fn expand_token_stream<T: ToLiteral>(
+fn expand_token_stream<T>(
     input: &proc_macro2::TokenStream,
     target: &syn::Ident,
-    value: &T,
-) -> proc_macro2::TokenStream {
+    index: &T,
+) -> proc_macro2::TokenStream
+where
+    T: ToLiteral + std::fmt::Display,
+{
     let mut expanded = Vec::new();
-    let mut iter = input.clone().into_iter();
+    let mut iter = input.clone().into_iter().peekable();
     while let Some(tree) = iter.next() {
-        expanded.push(expand_token_tree(&tree, target, value));
+        match tree {
+            proc_macro2::TokenTree::Punct(ref tilde) if tilde.as_char() == '~' => {
+                match (expanded.last(), iter.peek()) {
+                    (
+                        Some(proc_macro2::TokenTree::Ident(prev)),
+                        Some(proc_macro2::TokenTree::Ident(next)),
+                    ) if next == target => {
+                        // paste: ident ~ target
+                        let pasted =
+                            proc_macro2::Ident::new(&format!("{}{}", prev, index), prev.span());
+                        // move cursor
+                        expanded.pop();
+                        iter.next();
+                        // push
+                        expanded.push(proc_macro2::TokenTree::Ident(pasted))
+                    }
+                    _ => expanded.push(expand_token_tree(&tree, target, index)),
+                }
+            }
+            _ => expanded.push(expand_token_tree(&tree, target, index)),
+        }
     }
     let mut stream = proc_macro2::TokenStream::new();
     stream.extend(expanded);
