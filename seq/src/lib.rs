@@ -49,7 +49,7 @@ impl Seq {
 }
 
 impl syn::parse::Parse for Seq {
-    fn parse(input: syn::parse::ParseStream) -> Result<Self, syn::parse::Error> {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         // N in X..Y
         let target = input.parse::<syn::Ident>()?;
         let _in_token = input.parse::<syn::Token![in]>()?;
