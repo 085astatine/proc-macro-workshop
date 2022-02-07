@@ -1,5 +1,3 @@
-#![feature(step_trait)]
-
 #[proc_macro]
 pub fn seq(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let seq = syn::parse_macro_input!(input as Seq);
@@ -14,7 +12,7 @@ pub fn seq(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 struct Seq {
     target: syn::Ident,
     _in_token: syn::Token![in],
-    begin: syn::LitInt,
+    start: syn::LitInt,
     _dot2_token: syn::Token![..],
     end: syn::LitInt,
     token_tree: proc_macro2::TokenTree,
@@ -27,14 +25,14 @@ enum SeqExpandType {
 }
 
 impl Seq {
-    fn range<N>(&self) -> syn::Result<std::ops::Range<N>>
+    fn range<Index>(&self) -> syn::Result<SeqRange<Index>>
     where
-        N: std::str::FromStr,
-        N::Err: std::fmt::Display,
+        Index: SeqIndex,
+        <Index as std::str::FromStr>::Err: std::fmt::Display,
     {
-        let begin = self.begin.base10_parse::<N>()?;
-        let end = self.end.base10_parse::<N>()?;
-        Ok(begin..end)
+        let start = self.start.base10_parse::<Index>()?;
+        let end = self.end.base10_parse::<Index>()?;
+        Ok(SeqRange { start, end })
     }
 
     fn token_stream(&self) -> proc_macro2::TokenStream {
@@ -53,7 +51,7 @@ impl Seq {
         match self.expand_type() {
             SeqExpandType::Site => {
                 let mut streams = Vec::new();
-                for i in self.range::<i64>()? {
+                for i in &self.range::<i64>()? {
                     streams.push(expand_token_stream(self.token_stream(), &self.target, &i));
                 }
                 Ok(quote::quote! {
@@ -74,7 +72,7 @@ impl syn::parse::Parse for Seq {
         // N in X..Y
         let target = input.parse::<syn::Ident>()?;
         let _in_token = input.parse::<syn::Token![in]>()?;
-        let begin = input.parse::<syn::LitInt>()?;
+        let start = input.parse::<syn::LitInt>()?;
         let _dot2_token = input.parse::<syn::Token![..]>()?;
         let end = input.parse::<syn::LitInt>()?;
         // {...}
@@ -82,7 +80,7 @@ impl syn::parse::Parse for Seq {
         Ok(Seq {
             target,
             _in_token,
-            begin,
+            start,
             _dot2_token,
             end,
             token_tree,
@@ -107,10 +105,10 @@ fn expand_type(stream: proc_macro2::TokenStream) -> SeqExpandType {
     SeqExpandType::Site
 }
 
-fn expand_token_tree<T: ToLiteral + std::fmt::Display>(
+fn expand_token_tree<Index: SeqIndex>(
     tree: &proc_macro2::TokenTree,
     target: &syn::Ident,
-    index: &T,
+    index: &Index,
 ) -> proc_macro2::TokenTree {
     match tree {
         proc_macro2::TokenTree::Ident(ref ident) if ident == target => {
@@ -128,14 +126,11 @@ fn expand_token_tree<T: ToLiteral + std::fmt::Display>(
     }
 }
 
-fn expand_token_stream<T>(
+fn expand_token_stream<Index: SeqIndex>(
     input: proc_macro2::TokenStream,
     target: &syn::Ident,
-    index: &T,
-) -> proc_macro2::TokenStream
-where
-    T: ToLiteral + std::fmt::Display,
-{
+    index: &Index,
+) -> proc_macro2::TokenStream {
     let mut expanded = Vec::new();
     let mut iter = input.clone().into_iter().peekable();
     while let Some(tree) = iter.next() {
@@ -164,20 +159,16 @@ where
     proc_macro2::TokenStream::from_iter(expanded)
 }
 
-fn expand_repeat_section<T>(
+fn expand_repeat_section<Index: SeqIndex>(
     stream: proc_macro2::TokenStream,
     target: &proc_macro2::Ident,
-    range: &std::ops::Range<T>,
-) -> Vec<proc_macro2::TokenTree>
-where
-    T: ToLiteral + std::fmt::Display + std::iter::Step,
-{
+    range: &SeqRange<Index>,
+) -> Vec<proc_macro2::TokenTree> {
     let mut expanded = Vec::new();
     let mut iter = stream.into_iter();
     while let Some(tree) = iter.next() {
         // section: #(...)*
         if let Some(section) = extract_repeat_section(&tree, &mut iter) {
-            let range = range.clone();
             for i in range {
                 expanded.extend(expand_token_stream(section.clone(), target, &i));
             }
@@ -223,13 +214,63 @@ fn extract_repeat_section(
     None
 }
 
-trait ToLiteral {
+struct SeqRange<Index: SeqIndex> {
+    start: Index,
+    end: Index,
+}
+
+impl<Index: SeqIndex> IntoIterator for &SeqRange<Index> {
+    type Item = Index;
+    type IntoIter = SeqRangeIterator<Index>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Self::IntoIter {
+            next: self.start.clone(),
+            end: self.end.clone(),
+        }
+    }
+}
+
+struct SeqRangeIterator<Index: SeqIndex> {
+    next: Index,
+    end: Index,
+}
+
+impl<Index: SeqIndex> Iterator for SeqRangeIterator<Index> {
+    type Item = Index;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.next.clone();
+        self.next += Index::unit();
+        if value < self.end {
+            Some(value)
+        } else {
+            None
+        }
+    }
+}
+
+trait SeqIndex
+where
+    Self: Sized
+        + Clone
+        + std::cmp::PartialOrd
+        + std::ops::AddAssign
+        + std::str::FromStr
+        + std::fmt::Display,
+{
+    fn unit() -> Self;
+
     fn to_literal(&self, ident: &proc_macro2::Ident) -> proc_macro2::Literal;
 }
 
-macro_rules! impl_to_literal_for {
+macro_rules! impl_seq_index_for {
     ($ty:ty) => {
-        impl ToLiteral for $ty {
+        impl SeqIndex for $ty {
+            fn unit() -> Self {
+                1
+            }
+
             fn to_literal(&self, ident: &proc_macro2::Ident) -> proc_macro2::Literal {
                 paste::paste! {
                     let mut literal = proc_macro2::Literal::[< $ty _unsuffixed>] (*self);
@@ -241,13 +282,13 @@ macro_rules! impl_to_literal_for {
     };
 }
 
-impl_to_literal_for!(i8);
-impl_to_literal_for!(i16);
-impl_to_literal_for!(i32);
-impl_to_literal_for!(i64);
-impl_to_literal_for!(u8);
-impl_to_literal_for!(u16);
-impl_to_literal_for!(u32);
-impl_to_literal_for!(u64);
-impl_to_literal_for!(isize);
-impl_to_literal_for!(usize);
+impl_seq_index_for!(i8);
+impl_seq_index_for!(i16);
+impl_seq_index_for!(i32);
+impl_seq_index_for!(i64);
+impl_seq_index_for!(u8);
+impl_seq_index_for!(u16);
+impl_seq_index_for!(u32);
+impl_seq_index_for!(u64);
+impl_seq_index_for!(isize);
+impl_seq_index_for!(usize);
