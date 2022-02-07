@@ -13,7 +13,7 @@ struct Seq {
     target: syn::Ident,
     _in_token: syn::Token![in],
     start: syn::LitInt,
-    _dot2_token: syn::Token![..],
+    range_token: SeqRangeToken,
     end: syn::LitInt,
     token_tree: proc_macro2::TokenTree,
 }
@@ -24,15 +24,27 @@ enum SeqExpandType {
     Section,
 }
 
+#[derive(Debug)]
+enum SeqRangeToken {
+    Range(syn::Token![..]),
+    RangeInclusive(syn::Token![..=]),
+}
+
 impl Seq {
     fn range<Index>(&self) -> syn::Result<SeqRange<Index>>
     where
-        Index: SeqIndex,
+        Index: SeqIndex + std::ops::Add<Output = Index>,
         <Index as std::str::FromStr>::Err: std::fmt::Display,
     {
         let start = self.start.base10_parse::<Index>()?;
         let end = self.end.base10_parse::<Index>()?;
-        Ok(SeqRange { start, end })
+        match self.range_token {
+            SeqRangeToken::Range(_) => Ok(SeqRange { start, end }),
+            SeqRangeToken::RangeInclusive(_) => Ok(SeqRange {
+                start,
+                end: end + Index::unit(),
+            }),
+        }
     }
 
     fn token_stream(&self) -> proc_macro2::TokenStream {
@@ -73,7 +85,11 @@ impl syn::parse::Parse for Seq {
         let target = input.parse::<syn::Ident>()?;
         let _in_token = input.parse::<syn::Token![in]>()?;
         let start = input.parse::<syn::LitInt>()?;
-        let _dot2_token = input.parse::<syn::Token![..]>()?;
+        let range_token = if input.peek(syn::Token![..=]) {
+            SeqRangeToken::RangeInclusive(input.parse::<syn::Token![..=]>()?)
+        } else {
+            SeqRangeToken::Range(input.parse::<syn::Token![..]>()?)
+        };
         let end = input.parse::<syn::LitInt>()?;
         // {...}
         let token_tree = input.parse::<proc_macro2::TokenTree>()?;
@@ -81,7 +97,7 @@ impl syn::parse::Parse for Seq {
             target,
             _in_token,
             start,
-            _dot2_token,
+            range_token,
             end,
             token_tree,
         })
