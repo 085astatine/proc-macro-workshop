@@ -184,8 +184,8 @@ fn is_sorted_match(expr: &syn::ExprMatch) -> Option<syn::Error> {
     let arm_paths = match expr
         .arms
         .iter()
-        .map(|arm| match_arm_path(arm))
-        .collect::<syn::Result<Vec<&syn::Path>>>()
+        .map(|arm| MatchArmPat::new(arm))
+        .collect::<syn::Result<Vec<MatchArmPat>>>()
     {
         Ok(paths) => paths,
         Err(error) => {
@@ -195,76 +195,133 @@ fn is_sorted_match(expr: &syn::ExprMatch) -> Option<syn::Error> {
     // check if path is sorted
     if let Some(unsorted) = arm_paths
         .windows(2)
-        .find(|pair| compare_match_path(pair[0], pair[1]) == std::cmp::Ordering::Greater)
-        .map(|pair| pair[1])
+        .find(|pair| pair[0] > pair[1])
+        .map(|pair| &pair[1])
     {
-        use syn::spanned::Spanned;
-        let before = arm_paths
-            .iter()
-            .find(|path| compare_match_path(path, unsorted) == std::cmp::Ordering::Greater)
-            .unwrap();
+        let before = arm_paths.iter().find(|path| path > &unsorted).unwrap();
         return Some(syn::Error::new(
-            unsorted.span(),
+            *unsorted.span(),
             &format!(
                 "{} should sort before {}",
-                unsorted
-                    .segments
-                    .iter()
-                    .map(|path| path.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::"),
-                before
-                    .segments
-                    .iter()
-                    .map(|path| path.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::"),
+                unsorted.to_string(),
+                before.to_string(),
             ),
         ));
     }
     None
 }
 
-fn match_arm_path(arm: &syn::Arm) -> syn::Result<&syn::Path> {
-    match arm.pat {
-        syn::Pat::Path(ref pat) => Ok(&pat.path),
-        syn::Pat::Struct(ref pat) => Ok(&pat.path),
-        syn::Pat::TupleStruct(ref pat) => Ok(&pat.path),
-        _ => Err(syn::Error::new_spanned(
-            arm.pat.clone(),
-            "unsupported by #[sorted]",
-        )),
+#[derive(Debug)]
+struct MatchArmPatIdents {
+    idents: Vec<String>,
+    span: proc_macro2::Span,
+}
+
+impl PartialEq for MatchArmPatIdents {
+    fn eq(&self, other: &Self) -> bool {
+        self.idents.eq(&other.idents)
     }
 }
 
-fn compare_match_path(lhs: &syn::Path, rhs: &syn::Path) -> std::cmp::Ordering {
-    // lhs: '_'
-    if is_underscore_path(lhs) {
-        return if is_underscore_path(rhs) {
-            std::cmp::Ordering::Equal
-        } else {
-            std::cmp::Ordering::Less
-        };
+impl PartialOrd for MatchArmPatIdents {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.idents.partial_cmp(&other.idents)
     }
-    // rhs: "_"
-    if is_underscore_path(rhs) {
-        return std::cmp::Ordering::Greater;
+}
+
+impl ToString for MatchArmPatIdents {
+    fn to_string(&self) -> String {
+        self.idents.join("::")
     }
-    // segments
-    let mut segments = lhs.segments.iter().zip(rhs.segments.iter());
-    while let Some((lhs, rhs)) = segments.next() {
-        if let Some(order) = lhs.ident.to_string().partial_cmp(&rhs.ident.to_string()) {
-            if order != std::cmp::Ordering::Equal {
-                return order;
-            }
+}
+
+#[derive(Debug)]
+struct MatchArmPatWild {
+    span: proc_macro2::Span,
+}
+
+impl PartialEq for MatchArmPatWild {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl PartialOrd for MatchArmPatWild {
+    fn partial_cmp(&self, _other: &Self) -> Option<std::cmp::Ordering> {
+        Some(std::cmp::Ordering::Equal)
+    }
+}
+
+impl ToString for MatchArmPatWild {
+    fn to_string(&self) -> String {
+        "_".to_string()
+    }
+}
+
+#[derive(Debug, PartialEq, PartialOrd)]
+enum MatchArmPat {
+    Idents(MatchArmPatIdents),
+    Wild(MatchArmPatWild),
+}
+
+impl MatchArmPat {
+    fn new(arm: &syn::Arm) -> syn::Result<Self> {
+        match arm.pat {
+            syn::Pat::Ident(ref pat) => Ok(MatchArmPat::from(&pat.ident)),
+            syn::Pat::Path(ref pat) => Ok(MatchArmPat::from(&pat.path)),
+            syn::Pat::Struct(ref pat) => Ok(MatchArmPat::from(&pat.path)),
+            syn::Pat::TupleStruct(ref pat) => Ok(MatchArmPat::from(&pat.path)),
+            syn::Pat::Wild(ref pat) => Ok(MatchArmPat::from(pat)),
+            _ => Err(syn::Error::new_spanned(
+                arm.pat.clone(),
+                "unsupported by #[sorted]",
+            )),
         }
     }
-    lhs.segments.len().cmp(&rhs.segments.len())
+
+    fn span(&self) -> &proc_macro2::Span {
+        match self {
+            Self::Idents(idents) => &idents.span,
+            Self::Wild(wild) => &wild.span,
+        }
+    }
 }
 
-fn is_underscore_path(path: &syn::Path) -> bool {
-    if let Some(ident) = path.get_ident() {
-        return ident == "_";
+impl From<&syn::Ident> for MatchArmPat {
+    fn from(item: &syn::Ident) -> Self {
+        Self::Idents(MatchArmPatIdents {
+            idents: vec![item.to_string()],
+            span: item.span(),
+        })
     }
-    false
+}
+
+impl From<&syn::Path> for MatchArmPat {
+    fn from(item: &syn::Path) -> Self {
+        use syn::spanned::Spanned;
+        Self::Idents(MatchArmPatIdents {
+            idents: item
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
+            span: item.span(),
+        })
+    }
+}
+
+impl From<&syn::PatWild> for MatchArmPat {
+    fn from(item: &syn::PatWild) -> Self {
+        use syn::spanned::Spanned;
+        Self::Wild(MatchArmPatWild { span: item.span() })
+    }
+}
+
+impl ToString for MatchArmPat {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Idents(idents) => idents.to_string(),
+            Self::Wild(wild) => wild.to_string(),
+        }
+    }
 }
